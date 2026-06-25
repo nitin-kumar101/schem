@@ -264,10 +264,31 @@ def draw_bbox(
     thickness: int,
     padding: int,
 ) -> None:
-    x0 = max(0, bbox["x0"] - padding)
-    y0 = max(0, bbox["y0"] - padding)
-    x1 = min(image.shape[1] - 1, bbox["x1"] + padding)
-    y1 = min(image.shape[0] - 1, bbox["y1"] + padding)
+    img_h, img_w = image.shape[0], image.shape[1]
+
+    # Defensive normalization: handle inverted corners (x1<x0 / y1<y0)
+    # and negative coordinates that can come from malformed source PDFs
+    # (non-zero/negative MediaBox origins, rotated pages, bad word boxes).
+    raw_x0, raw_x1 = sorted((bbox["x0"], bbox["x1"]))
+    raw_y0, raw_y1 = sorted((bbox["y0"], bbox["y1"]))
+
+    x0 = max(0, min(raw_x0 - padding, img_w - 1))
+    y0 = max(0, min(raw_y0 - padding, img_h - 1))
+    x1 = max(0, min(raw_x1 + padding, img_w - 1))
+    y1 = max(0, min(raw_y1 + padding, img_h - 1))
+
+    if x1 <= x0 or y1 <= y0:
+        # Box collapsed entirely outside the visible canvas after
+        # clamping — nothing valid to draw. Surface this instead of
+        # silently producing an invisible highlight.
+        import logging
+        logging.getLogger(__name__).warning(
+            "Skipping highlight: bbox %s collapsed to degenerate box "
+            "after clamping to image bounds (%dx%d)",
+            bbox, img_w, img_h,
+        )
+        return
+
     cv2.rectangle(image, (x0, y0), (x1, y1), color, thickness)
 
     if label:
@@ -276,10 +297,11 @@ def draw_bbox(
         text_thickness = 1
         (tw, th), baseline = cv2.getTextSize(label, font, font_scale, text_thickness)
         label_y0 = max(0, y0 - th - baseline - 4)
+        label_x1 = min(img_w - 1, x0 + tw + 4)
         cv2.rectangle(
             image,
             (x0, label_y0),
-            (x0 + tw + 4, label_y0 + th + baseline + 4),
+            (label_x1, label_y0 + th + baseline + 4),
             color,
             -1,
         )

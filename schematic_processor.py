@@ -38,12 +38,43 @@ class BBox:
     x1: float
     y1: float
 
+    @classmethod
+    def from_raw(cls, x0: float, y0: float, x1: float, y1: float) -> "BBox":
+        """
+        Build a BBox from possibly-malformed raw coordinates.
+
+        Some PDFs (notably ones exported from EDA/CAD tools) have a
+        non-zero or negative-origin MediaBox, or contain word boxes where
+        x0 > x1 / top > bottom due to rotation or extraction quirks. Rather
+        than letting that silently propagate into negative or inverted
+        boxes downstream (which makes highlights disappear or land in the
+        wrong place), normalize here: clamp negatives to 0 and ensure the
+        corners are properly ordered.
+        """
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        return cls(
+            x0=max(0.0, x0),
+            y0=max(0.0, y0),
+            x1=max(0.0, x1),
+            y1=max(0.0, y1),
+        )
+
     def scale(self, factor: float) -> "BBox":
         return BBox(
             x0=round(self.x0 * factor, 2),
             y0=round(self.y0 * factor, 2),
             x1=round(self.x1 * factor, 2),
             y1=round(self.y1 * factor, 2),
+        )
+
+    def clamp_to(self, width: float, height: float) -> "BBox":
+        """Clip the box to fit within [0, width] x [0, height]."""
+        return BBox(
+            x0=min(max(0.0, self.x0), width),
+            y0=min(max(0.0, self.y0), height),
+            x1=min(max(0.0, self.x1), width),
+            y1=min(max(0.0, self.y1), height),
         )
 
     def to_int_dict(self) -> dict[str, int]:
@@ -53,8 +84,6 @@ class BBox:
             "x1": int(round(self.x1)),
             "y1": int(round(self.y1)),
         }
-
-
 @dataclass
 class Component:
     name: str
@@ -115,14 +144,14 @@ def classify_text(text: str) -> str:
     return "text"
 
 
-def word_to_bbox_pdf(word: dict[str, Any]) -> BBox:
-    return BBox(
+def word_to_bbox_pdf(word: dict[str, Any], pdf_width: float, pdf_height: float) -> BBox:
+    bbox = BBox.from_raw(
         x0=float(word["x0"]),
         y0=float(word["top"]),
         x1=float(word["x1"]),
         y1=float(word["bottom"]),
     )
-
+    return bbox.clamp_to(pdf_width, pdf_height)
 
 def components_to_words_bboxes(components: list[Component]) -> dict[str, list[dict[str, Any]]]:
     """Group components into words_bboxes JSONB shape: name -> [bbox entries]."""
@@ -210,7 +239,7 @@ def _process_single_page(args: tuple[Any, ...]) -> PageProcessResult:
             if not extract_all_text and kind != "reference_designator":
                 continue
 
-            bbox_pdf = word_to_bbox_pdf(word)
+            bbox_pdf = word_to_bbox_pdf(word,pdf_width,pdf_height)
             bbox_image = bbox_pdf.scale(total_scale)
             components.append(
                 Component(name=name, bbox=bbox_image, bbox_pdf=bbox_pdf, kind=kind)
