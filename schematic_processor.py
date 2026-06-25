@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -16,6 +17,8 @@ import pdfplumber
 
 from db import PageRecord, SchematicRepository
 from storage import StorageBackend
+
+logger = logging.getLogger(__name__)
 
 # Maximum total pixels (width * height) for rendered page images.
 MAX_PIXELS: int = 4_000_000
@@ -38,43 +41,12 @@ class BBox:
     x1: float
     y1: float
 
-    @classmethod
-    def from_raw(cls, x0: float, y0: float, x1: float, y1: float) -> "BBox":
-        """
-        Build a BBox from possibly-malformed raw coordinates.
-
-        Some PDFs (notably ones exported from EDA/CAD tools) have a
-        non-zero or negative-origin MediaBox, or contain word boxes where
-        x0 > x1 / top > bottom due to rotation or extraction quirks. Rather
-        than letting that silently propagate into negative or inverted
-        boxes downstream (which makes highlights disappear or land in the
-        wrong place), normalize here: clamp negatives to 0 and ensure the
-        corners are properly ordered.
-        """
-        x0, x1 = sorted((x0, x1))
-        y0, y1 = sorted((y0, y1))
-        return cls(
-            x0=max(0.0, x0),
-            y0=max(0.0, y0),
-            x1=max(0.0, x1),
-            y1=max(0.0, y1),
-        )
-
     def scale(self, factor: float) -> "BBox":
         return BBox(
             x0=round(self.x0 * factor, 2),
             y0=round(self.y0 * factor, 2),
             x1=round(self.x1 * factor, 2),
             y1=round(self.y1 * factor, 2),
-        )
-
-    def clamp_to(self, width: float, height: float) -> "BBox":
-        """Clip the box to fit within [0, width] x [0, height]."""
-        return BBox(
-            x0=min(max(0.0, self.x0), width),
-            y0=min(max(0.0, self.y0), height),
-            x1=min(max(0.0, self.x1), width),
-            y1=min(max(0.0, self.y1), height),
         )
 
     def to_int_dict(self) -> dict[str, int]:
@@ -84,6 +56,8 @@ class BBox:
             "x1": int(round(self.x1)),
             "y1": int(round(self.y1)),
         }
+
+
 @dataclass
 class Component:
     name: str
@@ -113,6 +87,7 @@ class PageProcessResult:
     image_png: bytes
     words_bboxes: dict[str, list[dict[str, Any]]]
     component_count: int
+    extraction_source: str = "pdfplumber"
 
 
 @dataclass
@@ -144,14 +119,14 @@ def classify_text(text: str) -> str:
     return "text"
 
 
-def word_to_bbox_pdf(word: dict[str, Any], pdf_width: float, pdf_height: float) -> BBox:
-    bbox = BBox.from_raw(
+def word_to_bbox_pdf(word: dict[str, Any]) -> BBox:
+    return BBox(
         x0=float(word["x0"]),
         y0=float(word["top"]),
         x1=float(word["x1"]),
         y1=float(word["bottom"]),
     )
-    return bbox.clamp_to(pdf_width, pdf_height)
+
 
 def components_to_words_bboxes(components: list[Component]) -> dict[str, list[dict[str, Any]]]:
     """Group components into words_bboxes JSONB shape: name -> [bbox entries]."""
@@ -196,6 +171,89 @@ def encode_png(image: np.ndarray) -> bytes:
     return buffer.tobytes()
 
 
+# ---------------------------------------------------------------------------
+# Word extraction: pdfplumber (default) with fitz fallback
+# ---------------------------------------------------------------------------
+
+def _extract_words_pdfplumber(page: "pdfplumber.page.Page") -> list[dict[str, Any]]:
+    """Extract words via pdfplumber, in its native dict shape (x0/top/x1/bottom/text)."""
+    return page.extract_words(use_text_flow=True, keep_blank_chars=False)
+
+
+def _extract_words_fitz(pdf_path: str, page_index: int) -> list[dict[str, Any]]:
+    """
+    Extract words via fitz (PyMuPDF) and normalize them into the same dict
+    shape pdfplumber uses, so downstream code (classify_text,
+    word_to_bbox_pdf, Component construction) doesn't need to branch on
+    extraction source.
+
+    fitz's page.get_text("words") returns tuples:
+        (x0, y0, x1, y1, "word", block_no, line_no, word_no)
+    in the page's own point space (top-left origin, y increasing downward),
+    which matches pdfplumber's x0/top/x1/bottom convention directly.
+    """
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        raw_words = page.get_text("words")
+        words: list[dict[str, Any]] = []
+        for x0, y0, x1, y1, text, *_rest in raw_words:
+            words.append(
+                {
+                    "x0": float(x0),
+                    "top": float(y0),
+                    "x1": float(x1),
+                    "bottom": float(y1),
+                    "text": text,
+                }
+            )
+        return words
+    finally:
+        doc.close()
+
+
+def _has_negative_coords(words: list[dict[str, Any]]) -> bool:
+    """True if any extracted word has a negative coordinate on any edge."""
+    for word in words:
+        if (
+            float(word["x0"]) < 0
+            or float(word["top"]) < 0
+            or float(word["x1"]) < 0
+            or float(word["bottom"]) < 0
+        ):
+            return True
+    return False
+
+
+def extract_page_words(
+    pdf_path: str,
+    page_index: int,
+    page: "pdfplumber.page.Page",
+) -> tuple[list[dict[str, Any]], str]:
+    """
+    Extract words for a page, preferring pdfplumber. If pdfplumber reports
+    any word with a negative coordinate (seen on some PDFs with unusual
+    MediaBox origins / export quirks, which otherwise causes highlights to
+    be hidden or misaligned downstream), discard those results and
+    re-extract the whole page using fitz instead.
+
+    Returns (words, source) where source is "pdfplumber" or "fitz".
+    """
+    words = _extract_words_pdfplumber(page)
+
+    if not _has_negative_coords(words):
+        return words, "pdfplumber"
+
+    logger.warning(
+        "pdfplumber returned negative coordinates on page %d of %s; "
+        "falling back to fitz for this page",
+        page_index + 1,
+        pdf_path,
+    )
+    fitz_words = _extract_words_fitz(pdf_path, page_index)
+    return fitz_words, "fitz"
+
+
 def _process_single_page(args: tuple[Any, ...]) -> PageProcessResult:
     """
     Worker entry point for parallel page processing.
@@ -227,8 +285,10 @@ def _process_single_page(args: tuple[Any, ...]) -> PageProcessResult:
             image = resize_image(image, downscale)
             img_w, img_h = image.shape[1], image.shape[0]
 
+        raw_words, extraction_source = extract_page_words(str(pdf_path), page_index, page)
+
         components: list[Component] = []
-        for word in page.extract_words(use_text_flow=True, keep_blank_chars=False):
+        for word in raw_words:
             name = word.get("text", "").strip()
             if not name:
                 continue
@@ -239,7 +299,7 @@ def _process_single_page(args: tuple[Any, ...]) -> PageProcessResult:
             if not extract_all_text and kind != "reference_designator":
                 continue
 
-            bbox_pdf = word_to_bbox_pdf(word,pdf_width,pdf_height)
+            bbox_pdf = word_to_bbox_pdf(word)
             bbox_image = bbox_pdf.scale(total_scale)
             components.append(
                 Component(name=name, bbox=bbox_image, bbox_pdf=bbox_pdf, kind=kind)
@@ -257,6 +317,7 @@ def _process_single_page(args: tuple[Any, ...]) -> PageProcessResult:
         image_png=encode_png(image),
         words_bboxes=components_to_words_bboxes(components),
         component_count=len(components),
+        extraction_source=extraction_source,
     )
 
 
@@ -352,6 +413,7 @@ class SchematicProcessor:
                 "total_scale": page.total_scale,
                 "component_count": page.component_count,
                 "max_pixels": self.max_pixels,
+                "extraction_source": page.extraction_source,
             }
 
             row_id = self.repository.insert_page(
@@ -417,14 +479,6 @@ def process_pdf(
         image_path = pages_dir / image_name
         image_path.write_bytes(page.image_png)
 
-        components = [
-            {
-                "name": name,
-                "kind": entries[0]["kind"],
-                "bbox": {k: entries[0][k] for k in ("x0", "y0", "x1", "y1")},
-            }
-            for name, entries in page.words_bboxes.items()
-        ]
         # Expand duplicate names into separate component entries
         expanded_components: list[dict[str, Any]] = []
         for name, entries in page.words_bboxes.items():
@@ -449,6 +503,7 @@ def process_pdf(
                 "downscale_factor": page.downscale_factor,
                 "total_scale": page.total_scale,
                 "component_count": page.component_count,
+                "extraction_source": page.extraction_source,
                 "components": expanded_components,
                 "words_bboxes": page.words_bboxes,
             }
@@ -475,6 +530,8 @@ def main() -> None:
     parser.add_argument("--max-pixels", type=int, default=MAX_PIXELS)
     parser.add_argument("--components-only", action="store_true")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
 
     json_path = process_pdf(
         args.pdf_path,

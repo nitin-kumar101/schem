@@ -13,6 +13,7 @@
       "downscale_factor": 1.0,
       "total_scale": 1.0,
       "component_count": 525,
+      "extraction_source": "pdfplumber",
       "components": [
         {
           "name": "USB_VBUS_LINK",
@@ -9566,6 +9567,7 @@
       "downscale_factor": 1.0,
       "total_scale": 1.0,
       "component_count": 813,
+      "extraction_source": "pdfplumber",
       "components": [
         {
           "name": "IF_TDO_SWO",
@@ -24095,6 +24097,7 @@
       "downscale_factor": 1.0,
       "total_scale": 1.0,
       "component_count": 484,
+      "extraction_source": "pdfplumber",
       "components": [
         {
           "name": "SSP0_SSEL_LINK",
@@ -32861,6 +32864,7 @@
       "downscale_factor": 1.0,
       "total_scale": 1.0,
       "component_count": 634,
+      "extraction_source": "pdfplumber",
       "components": [
         {
           "name": "BRIDGE_SDA-WAKEUP",
@@ -44301,6 +44305,7 @@
       "downscale_factor": 1.0,
       "total_scale": 1.0,
       "component_count": 432,
+      "extraction_source": "pdfplumber",
       "components": [
         {
           "name": "BRIDGE_T_MISO",
@@ -52085,6 +52090,7 @@
       "downscale_factor": 1.0,
       "total_scale": 1.0,
       "component_count": 496,
+      "extraction_source": "pdfplumber",
       "components": [
         {
           "name": "P1_8-ADC11-FC7_TXD_SCL_MISO_FRAME",
